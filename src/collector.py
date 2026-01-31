@@ -11,8 +11,9 @@ import time
 import base64
 import logging
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any, Callable
 from urllib.parse import urlparse
+from functools import wraps
 
 import requests
 import pandas as pd
@@ -31,9 +32,66 @@ class AuthenticationError(GroupIBAPIError):
   pass
 
 
+# RateLimitError는 현재 미사용이지만 향후 확장성을 위해 보존
 class RateLimitError(GroupIBAPIError):
   """Rate Limit 초과 예외 (HTTP 429)"""
   pass
+
+
+# ===== 유틸리티 함수 =====
+
+def retryOnError(maxAttempts: int = 3,
+                 baseWaitTime: int = 1,
+                 exponentialBackoff: bool = False) -> Callable:
+  """재시도 데코레이터
+
+  네트워크 오류, 타임아웃, 서버 오류 발생 시 자동으로 재시도합니다.
+
+  Args:
+    maxAttempts: 최대 재시도 횟수 (기본값: 3)
+    baseWaitTime: 기본 대기 시간(초) (기본값: 1)
+    exponentialBackoff: 지수 백오프 사용 여부 (기본값: False)
+
+  Returns:
+    데코레이터 함수
+  """
+  def decorator(func: Callable) -> Callable:
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+      lastException = None
+
+      for attempt in range(maxAttempts):
+        try:
+          return func(*args, **kwargs)
+        except (requests.exceptions.Timeout,
+                requests.exceptions.RequestException) as e:
+          lastException = e
+
+          if attempt < maxAttempts - 1:
+            if exponentialBackoff:
+              waitTime = baseWaitTime * (2 ** attempt)
+            else:
+              waitTime = baseWaitTime * (attempt + 1)
+
+            # 로거가 있으면 사용
+            if args and hasattr(args[0], 'logger'):
+              args[0].logger.warning(
+                f"⚠ 재시도 {attempt + 1}/{maxAttempts - 1}: {e}. "
+                f"{waitTime}초 대기 중..."
+              )
+
+            time.sleep(waitTime)
+          else:
+            if args and hasattr(args[0], 'logger'):
+              args[0].logger.error(
+                f"✗ {maxAttempts}회 재시도 실패: {e}"
+              )
+
+      # 모든 재시도 실패 시 마지막 예외 발생
+      raise lastException
+
+    return wrapper
+  return decorator
 
 
 # ===== Collector 클래스 =====
@@ -64,8 +122,13 @@ class GroupIBCollector:
     if not self.username or not self.apiKey:
       raise ValueError(".env 파일에 GROUPIB_USERNAME과 GROUPIB_API_KEY가 설정되어 있어야 합니다.")
 
-    # 기본 URL 설정
-    self.baseUrl = "https://tap.group-ib.com"
+    # 기본 URL 설정 (환경 변수로 오버라이드 가능)
+    self.baseUrl = os.getenv('GROUPIB_BASE_URL', 'https://tap.group-ib.com')
+
+    # 설정 가능한 파라미터들
+    self.requestTimeout = int(os.getenv('REQUEST_TIMEOUT', '30'))
+    self.rateLimitWait = int(os.getenv('RATE_LIMIT_WAIT', '1'))
+    self.maxRetries = int(os.getenv('MAX_RETRIES', '3'))
 
     # 경로 설정
     self.projectRoot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -85,6 +148,9 @@ class GroupIBCollector:
 
     # 엔드포인트 리스트 (나중에 load_endpoints()로 로드)
     self.endpoints = []
+
+    # 실패한 엔드포인트 추적
+    self.failedEndpoints = []
 
     self.logger.info("=" * 40)
     self.logger.info("Group-IB API 크롤러 초기화 완료")
@@ -162,7 +228,7 @@ class GroupIBCollector:
     headers = self.buildAuthHeader()
 
     try:
-      response = requests.get(authUrl, headers=headers, timeout=30)
+      response = requests.get(authUrl, headers=headers, timeout=self.requestTimeout)
 
       if response.status_code == 200:
         self.logger.info("✓ API 인증 성공")
@@ -194,41 +260,70 @@ class GroupIBCollector:
         },
         ...
       ]
+
+    Raises:
+      FileNotFoundError: CSV 파일이 존재하지 않을 때
+      ValueError: CSV 형식이 잘못되었을 때
     """
     if not os.path.exists(self.csvFile):
       raise FileNotFoundError(f"list.csv 파일을 찾을 수 없습니다: {self.csvFile}")
 
-    # pandas로 CSV 읽기
-    df = pd.read_csv(self.csvFile)
+    try:
+      # pandas로 CSV 읽기
+      df = pd.read_csv(self.csvFile)
 
-    endpointsList = []
+      # 필수 컬럼 검증
+      requiredColumns = ['endpoint', 'params']
+      missingColumns = [col for col in requiredColumns if col not in df.columns]
+      if missingColumns:
+        raise ValueError(f"CSV 파일에 필수 컬럼이 누락되었습니다: {', '.join(missingColumns)}")
 
-    for _, row in df.iterrows():
-      url = row['endpoint']
-      paramsStr = row['params']
+      endpointsList = []
 
-      # URL에서 엔드포인트 경로 추출
-      parsed = urlparse(url)
-      endpointPath = parsed.path
+      for index, row in df.iterrows():
+        try:
+          url = row['endpoint']
+          paramsStr = row['params']
 
-      # 파라미터 파싱 (key=value 형식)
-      params = {}
-      if pd.notna(paramsStr):
-        for param in paramsStr.split('&'):
-          if '=' in param:
-            key, value = param.split('=', 1)
-            params[key.strip()] = value.strip()
+          # URL 검증
+          if pd.isna(url) or not isinstance(url, str):
+            self.logger.warning(f"라인 {index + 2}: URL이 유효하지 않습니다. 건너뜁니다.")
+            continue
 
-      endpointsList.append({
-        'url': url,
-        'endpoint': endpointPath,
-        'params': params
-      })
+          # URL에서 엔드포인트 경로 추출
+          parsed = urlparse(url)
+          endpointPath = parsed.path
 
-    self.endpoints = endpointsList
-    self.logger.info(f"✓ {len(endpointsList)}개 엔드포인트 로드 완료")
+          # 파라미터 파싱 (key=value 형식)
+          params = {}
+          if pd.notna(paramsStr):
+            for param in paramsStr.split('&'):
+              if '=' in param:
+                key, value = param.split('=', 1)
+                params[key.strip()] = value.strip()
 
-    return endpointsList
+          endpointsList.append({
+            'url': url,
+            'endpoint': endpointPath,
+            'params': params
+          })
+
+        except Exception as e:
+          self.logger.warning(f"라인 {index + 2} 파싱 실패: {e}. 건너뜁니다.")
+          continue
+
+      if not endpointsList:
+        raise ValueError("유효한 엔드포인트가 하나도 로드되지 않았습니다.")
+
+      self.endpoints = endpointsList
+      self.logger.info(f"✓ {len(endpointsList)}개 엔드포인트 로드 완료")
+
+      return endpointsList
+
+    except pd.errors.EmptyDataError:
+      raise ValueError("CSV 파일이 비어 있습니다.")
+    except pd.errors.ParserError as e:
+      raise ValueError(f"CSV 파일 파싱 오류: {e}")
 
   def loadSeqUpdate(self) -> Dict[str, int]:
     """data/seq_update.json에서 seqUpdate 값 로드
@@ -251,7 +346,7 @@ class GroupIBCollector:
       return {}
 
   def saveSeqUpdate(self, seqUpdates: Dict[str, int]) -> bool:
-    """data/seq_update.json에 seqUpdate 값 저장
+    """data/seq_update.json에 seqUpdate 값 저장 (원자적 쓰기 + 백업)
 
     Args:
       seqUpdates: 엔드포인트별 seqUpdate 딕셔너리
@@ -260,16 +355,42 @@ class GroupIBCollector:
       저장 성공 시 True, 실패 시 False
     """
     try:
-      with open(self.seqUpdateFile, 'w', encoding='utf-8') as f:
+      # 1. 백업 파일 생성 (기존 파일이 있는 경우)
+      if os.path.exists(self.seqUpdateFile):
+        backupFile = self.seqUpdateFile + '.bak'
+        try:
+          with open(self.seqUpdateFile, 'r', encoding='utf-8') as src:
+            with open(backupFile, 'w', encoding='utf-8') as dst:
+              dst.write(src.read())
+        except Exception as e:
+          self.logger.warning(f"백업 파일 생성 실패: {e}")
+
+      # 2. 임시 파일에 먼저 쓰기 (원자적 쓰기)
+      tempFile = self.seqUpdateFile + '.tmp'
+      with open(tempFile, 'w', encoding='utf-8') as f:
         json.dump(seqUpdates, f, indent=2, ensure_ascii=False)
+
+      # 3. 임시 파일을 실제 파일로 교체
+      if os.path.exists(self.seqUpdateFile):
+        os.remove(self.seqUpdateFile)
+      os.rename(tempFile, self.seqUpdateFile)
+
       self.logger.info(f"✓ seqUpdate 저장 완료: {self.seqUpdateFile}")
       return True
+
     except Exception as e:
       self.logger.error(f"✗ seqUpdate 저장 실패: {e}")
+      # 임시 파일 정리
+      tempFile = self.seqUpdateFile + '.tmp'
+      if os.path.exists(tempFile):
+        try:
+          os.remove(tempFile)
+        except:
+          pass
       return False
 
   def fetchApi(self, url: str, params: Dict[str, str],
-               retryCount: int = 0) -> Optional[Dict]:
+               retryCount: int = 0) -> Optional[Dict[str, Any]]:
     """API 요청 및 응답 처리 (재시도 로직 포함)
 
     Args:
@@ -283,7 +404,7 @@ class GroupIBCollector:
     headers = self.buildAuthHeader()
 
     try:
-      response = requests.get(url, headers=headers, params=params, timeout=30)
+      response = requests.get(url, headers=headers, params=params, timeout=self.requestTimeout)
 
       # HTTP 200 성공
       if response.status_code == 200:
@@ -341,8 +462,8 @@ class GroupIBCollector:
         self.logger.error(f"✗ 네트워크 오류 재시도 3회 실패: {url} - {e}")
         return None
 
-  def extractDataAndSeqUpdate(self, response: Dict,
-                               endpoint: str) -> Tuple[List, int]:
+  def extractDataAndSeqUpdate(self, response: Dict[str, Any],
+                               endpoint: str) -> Tuple[List[Dict[str, Any]], int]:
     """응답에서 데이터와 seqUpdate 추출
 
     Args:
@@ -393,9 +514,9 @@ class GroupIBCollector:
 
     return filename
 
-  def saveToJsonl(self, endpoint: str, items: List[Dict],
+  def saveToJsonl(self, endpoint: str, items: List[Dict[str, Any]],
                   seqUpdate: int) -> bool:
-    """데이터를 JSON Lines 형식으로 저장
+    """데이터를 JSON Lines 형식으로 저장 (에러 핸들링 강화)
 
     Args:
       endpoint: 엔드포인트 경로
@@ -412,27 +533,46 @@ class GroupIBCollector:
     filename = self.urlToFilename(endpoint)
     filepath = os.path.join(self.outputsDir, filename)
 
+    successCount = 0
+    failCount = 0
+
     try:
       with open(filepath, 'a', encoding='utf-8') as f:
-        for item in items:
-          record = {
-            'timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
-            'source': 'groupib-api',
-            'endpoint': endpoint,
-            'seqUpdate': seqUpdate,
-            'data': item
-          }
-          f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        for index, item in enumerate(items):
+          try:
+            record = {
+              'timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
+              'source': 'groupib-api',
+              'endpoint': endpoint,
+              'seqUpdate': seqUpdate,
+              'data': item
+            }
+            # JSON 직렬화 테스트
+            jsonLine = json.dumps(record, ensure_ascii=False)
+            f.write(jsonLine + '\n')
+            successCount += 1
 
-      self.logger.info(f"  ✓ 저장 완료: {filepath} ({len(items)}건)")
-      return True
+          except (TypeError, ValueError) as e:
+            failCount += 1
+            self.logger.warning(f"  항목 {index + 1} JSON 직렬화 실패: {e}")
+            continue
 
+      if failCount > 0:
+        self.logger.warning(f"  ⚠ 저장 완료: {filepath} (성공: {successCount}건, 실패: {failCount}건)")
+      else:
+        self.logger.info(f"  ✓ 저장 완료: {filepath} ({successCount}건)")
+
+      return successCount > 0  # 최소 1건 이상 성공 시 True
+
+    except IOError as e:
+      self.logger.error(f"  ✗ 파일 I/O 오류: {filepath} - {e}")
+      return False
     except Exception as e:
       self.logger.error(f"  ✗ 파일 저장 실패: {filepath} - {e}")
       return False
 
-  def collectSingleEndpoint(self, endpointConfig: Dict,
-                            seqUpdates: Dict) -> Tuple[bool, int]:
+  def collectSingleEndpoint(self, endpointConfig: Dict[str, Any],
+                            seqUpdates: Dict[str, int]) -> Tuple[bool, int]:
     """단일 엔드포인트 데이터 수집
 
     Args:
@@ -482,7 +622,7 @@ class GroupIBCollector:
       return False, 0
 
   def collectAllEndpoints(self) -> Dict[str, int]:
-    """모든 엔드포인트 순차 수집
+    """모든 엔드포인트 순차 수집 (실패한 엔드포인트 우선 재시도)
 
     Returns:
       업데이트된 seqUpdate 딕셔너리
@@ -494,7 +634,21 @@ class GroupIBCollector:
     # seqUpdate 로드
     seqUpdates = self.loadSeqUpdate()
 
-    totalEndpoints = len(self.endpoints)
+    # 수집할 엔드포인트 목록 (실패한 엔드포인트 우선)
+    endpointsToCollect = []
+
+    # 1. 이전에 실패한 엔드포인트 우선 추가
+    if self.failedEndpoints:
+      self.logger.info(f"이전 사이클에서 실패한 {len(self.failedEndpoints)}개 엔드포인트를 우선 재시도합니다.")
+      endpointsToCollect.extend(self.failedEndpoints)
+
+    # 2. 나머지 엔드포인트 추가 (중복 제거)
+    failedEndpointPaths = {ep['endpoint'] for ep in self.failedEndpoints}
+    for ep in self.endpoints:
+      if ep['endpoint'] not in failedEndpointPaths:
+        endpointsToCollect.append(ep)
+
+    totalEndpoints = len(endpointsToCollect)
     self.logger.info("")
     self.logger.info("=" * 40)
     self.logger.info(f"수집 사이클 시작 ({totalEndpoints}개 엔드포인트)")
@@ -502,8 +656,9 @@ class GroupIBCollector:
 
     successCount = 0
     totalRecords = 0
+    newFailedEndpoints = []
 
-    for idx, endpointConfig in enumerate(self.endpoints, 1):
+    for idx, endpointConfig in enumerate(endpointsToCollect, 1):
       endpoint = endpointConfig['endpoint']
 
       self.logger.info(f"\n[{idx}/{totalEndpoints}] {endpoint}")
@@ -513,16 +668,25 @@ class GroupIBCollector:
       if success:
         successCount += 1
         totalRecords += recordCount
+      else:
+        # 실패한 엔드포인트 기록
+        newFailedEndpoints.append(endpointConfig)
 
-      # Rate Limit 방지를 위한 엔드포인트 간 1초 대기
+      # Rate Limit 방지를 위한 엔드포인트 간 대기
       if idx < totalEndpoints:
-        time.sleep(1)
+        time.sleep(self.rateLimitWait)
+
+    # 실패한 엔드포인트 목록 업데이트
+    self.failedEndpoints = newFailedEndpoints
 
     self.logger.info("")
     self.logger.info("=" * 40)
     self.logger.info(f"수집 사이클 완료")
     self.logger.info(f"  성공: {successCount}/{totalEndpoints} 엔드포인트")
+    self.logger.info(f"  실패: {len(newFailedEndpoints)}/{totalEndpoints} 엔드포인트")
     self.logger.info(f"  총 수집: {totalRecords}건")
+    if newFailedEndpoints:
+      self.logger.warning(f"  다음 사이클에서 실패한 엔드포인트를 재시도합니다.")
     self.logger.info("=" * 40)
 
     return seqUpdates

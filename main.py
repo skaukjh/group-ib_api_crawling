@@ -10,9 +10,14 @@ Group-IB API 크롤러 - 메인 엔트리 포인트
   python main.py
 """
 
+import os
 import time
 import sys
+from dotenv import load_dotenv
 from src.collector import GroupIBCollector, AuthenticationError
+
+# 환경 변수 로드
+load_dotenv()
 
 
 def main():
@@ -41,6 +46,7 @@ def main():
 
     # 4. 무한 루프 (30분 간격 수집)
     cycleNumber = 0
+    seqUpdates = {}  # 변수 초기화 (스코프 문제 해결)
 
     while True:
       cycleNumber += 1
@@ -52,8 +58,8 @@ def main():
         # seqUpdate 저장
         collector.saveSeqUpdate(seqUpdates)
 
-        # 30분 대기
-        waitMinutes = 30
+        # 대기 시간 설정 (환경 변수로 오버라이드 가능, 기본값: 30분)
+        waitMinutes = int(os.getenv('WAIT_MINUTES', '30'))
         waitSeconds = waitMinutes * 60
 
         collector.logger.info("")
@@ -91,10 +97,12 @@ def main():
       collector.logger.info("=" * 40)
       collector.logger.info("사용자가 프로그램 종료를 요청했습니다 (Ctrl+C)")
 
-      # seqUpdate 최종 저장
-      if 'seqUpdates' in locals():
+      # seqUpdate 최종 저장 (변수 존재 여부와 빈 딕셔너리 체크)
+      if 'seqUpdates' in locals() and seqUpdates:
         collector.logger.info("seqUpdate 최종 저장 중...")
         collector.saveSeqUpdate(seqUpdates)
+      else:
+        collector.logger.info("저장할 seqUpdate 데이터가 없습니다.")
 
       collector.logger.info("프로그램을 정상 종료합니다.")
       collector.logger.info("=" * 40)
