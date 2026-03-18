@@ -9,7 +9,14 @@
       "Bash(timeout 60 python:*)",
       "Bash(python test_auth.py:*)",
       "Bash(powershell:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(for file:*)",
+      "Bash(do echo:*)",
+      "Read(//d/99. Project/TI/Crawler/외부 인텔리전스 서비스/group-ib_api_crawling-main\\(2603_정상동작\\)/group-ib_api_crawling-main/**)",
+      "Bash(python3 -m json.tool)",
+      "Bash(done)",
+      "Bash(cd \"D:/99. Project/TI/Crawler/외부 인텔리전스 서비스/group-ib_api_crawling-main\\(2603_정상동작\\)/group-ib_api_crawling-main/data/outputs\" && head -1 apt_threat_actor_updated.jsonl | python3 -c \"import sys, json; obj = json.load\\(sys.stdin\\); print\\(json.dumps\\(obj, indent=2, ensure_ascii=False\\)\\)\" | head -60)",
+      "Bash(python3:*)"
     ]
   }
 }

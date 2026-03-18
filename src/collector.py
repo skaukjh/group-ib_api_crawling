@@ -134,6 +134,7 @@ class GroupIBCollector:
     self.projectRoot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     self.dataDir = os.path.join(self.projectRoot, "data")
     self.outputsDir = os.path.join(self.dataDir, "outputs")
+    self.pdfsDir = os.path.join(self.dataDir, "pdfs")
     self.logsDir = os.path.join(self.projectRoot, "logs")
     self.seqUpdateFile = os.path.join(self.dataDir, "seq_update.json")
     self.csvFile = os.path.join(self.projectRoot, "list.csv")
@@ -141,6 +142,7 @@ class GroupIBCollector:
     # 디렉토리 생성
     os.makedirs(self.dataDir, exist_ok=True)
     os.makedirs(self.outputsDir, exist_ok=True)
+    os.makedirs(self.pdfsDir, exist_ok=True)
     os.makedirs(self.logsDir, exist_ok=True)
 
     # 로거 설정
@@ -514,9 +516,70 @@ class GroupIBCollector:
 
     return filename
 
+  def downloadPdf(self, portalLink: str, documentId: str, endpoint: str) -> bool:
+    """portalLink에서 PDF 파일 다운로드 및 저장
+
+    Args:
+      portalLink: PDF 다운로드 링크
+      documentId: 문서 ID (파일명 생성용)
+      endpoint: 엔드포인트 경로 (디렉토리 생성용)
+
+    Returns:
+      다운로드 성공 시 True, 실패 시 False
+    """
+    if not portalLink:
+      return False
+
+    try:
+      # 엔드포인트 이름으로 서브디렉토리 생성
+      endpointDirName = endpoint.replace('/api/v2/', '').replace('/', '_')
+      pdfSubDir = os.path.join(self.pdfsDir, endpointDirName)
+      os.makedirs(pdfSubDir, exist_ok=True)
+
+      # PDF 파일 경로
+      pdfFilepath = os.path.join(pdfSubDir, f"{documentId}.pdf")
+
+      # 이미 다운로드된 파일이면 건너뛰기
+      if os.path.exists(pdfFilepath):
+        return True
+
+      # PDF 다운로드
+      headers = self.buildAuthHeader()
+      response = requests.get(portalLink, headers=headers, timeout=self.requestTimeout)
+
+      if response.status_code != 200:
+        self.logger.warning(f"  PDF 다운로드 실패 ({response.status_code}): {documentId}")
+        return False
+
+      # 파일 저장 (임시 파일에 먼저 저장 후 교체)
+      tempFilepath = pdfFilepath + '.tmp'
+      with open(tempFilepath, 'wb') as f:
+        f.write(response.content)
+
+      # 임시 파일을 실제 파일로 교체
+      if os.path.exists(pdfFilepath):
+        os.remove(pdfFilepath)
+      os.rename(tempFilepath, pdfFilepath)
+
+      self.logger.info(f"  ✓ PDF 다운로드: {documentId}")
+      return True
+
+    except requests.exceptions.Timeout:
+      self.logger.warning(f"  PDF 다운로드 타임아웃: {documentId}")
+      return False
+    except requests.exceptions.RequestException as e:
+      self.logger.warning(f"  PDF 다운로드 오류: {documentId} - {e}")
+      return False
+    except IOError as e:
+      self.logger.warning(f"  PDF 파일 저장 오류: {documentId} - {e}")
+      return False
+    except Exception as e:
+      self.logger.warning(f"  PDF 처리 오류: {documentId} - {e}")
+      return False
+
   def saveToJsonl(self, endpoint: str, items: List[Dict[str, Any]],
                   seqUpdate: int) -> bool:
-    """데이터를 JSON Lines 형식으로 저장 (에러 핸들링 강화)
+    """데이터를 JSON Lines 형식으로 저장 및 PDF 다운로드
 
     Args:
       endpoint: 엔드포인트 경로
@@ -540,6 +603,14 @@ class GroupIBCollector:
       with open(filepath, 'a', encoding='utf-8') as f:
         for index, item in enumerate(items):
           try:
+            # PDF 다운로드 시도 (file.portalLink가 있는 경우)
+            if isinstance(item, dict):
+              fileData = item.get('file')
+              if isinstance(fileData, dict) and 'portalLink' in fileData:
+                documentId = item.get('id', f"unknown_{index}")
+                portalLink = fileData.get('portalLink')
+                self.downloadPdf(portalLink, documentId, endpoint)
+
             record = {
               'timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
               'source': 'groupib-api',
